@@ -91,6 +91,21 @@ label.chk input[type="checkbox"] {
   cursor: pointer;
 }
 
+/* v8.7: 六卡检查开关行(顶栏下方,常驻) */
+.toggles {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px 12px;
+  padding: 7px 12px;
+  background: #252526;
+  border-bottom: 1px solid #3a3a3a;
+}
+.toggles-hint { flex: 1 0 100%; font-size: 10px; color: #777; }
+/* v8.7: 已关闭的占位卡——整卡降透明度,标题转灰,徽标用中性灰 */
+.card.card-off { opacity: 0.55; }
+.card.card-off .card-head { color: #999; }
+.chip.off { background: #333; color: #999; border: 1px solid #4a4a4a; }
+
 /* 缺失字体条目的橙色三角感叹号 */
 .missing-font .warn-tri {
   color: #f0a040;

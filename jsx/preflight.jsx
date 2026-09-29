@@ -103,7 +103,7 @@ function pfStringify(value) {
 // 版本一致 → 跳过 $.evalFile 直接调用函数(省掉每次重载 28KB 脚本);
 // 不一致/不存在 → 强制重载一次。这样开发期改完 JSX 无需重启 AI。
 // v7.2: 仅随版本号递增(本版为面板文案一致化,检测逻辑与返回结构零改动)。
-var PF_BUILD = "8.6";
+var PF_BUILD = "8.7.6";
 
 var PT2MM = 0.3527777778;     // 1 pt = 0.3528 mm
 var MAX_SCAN = 3000;          // 每类对象最多扫描数量(防大卡死)
@@ -459,10 +459,44 @@ function pfDocKey() {
 // ============================================================
 // 主检查入口(单遍扫描)
 // ============================================================
-function runPreflight() {
+// v8.7: 六卡检查开关 —— c1~c6 对应卡 ①画板出血 ②隐藏 ③字体 ④嵌入 ⑤分辨率 ⑥油墨叠印描边。
+//       缺省(undefined)= 开,兼容旧调用 runPreflight(); 0 / false / "0" = 关。
+function pfCkOn(v) { return !(v === 0 || v === false || v === "0"); }
+
+// v8.7.6(实验②修正): 用集合自带 every() 迭代,由宿主内部逐个递交对象,免 items[ii]
+//   每次 ~0.25ms 的索引开销(实测占遍历 70%)。8.7.5 用 typeof==="function" 检测在
+//   真实 AI 上判 false(集合无此方法,或 ExtendScript 对宿主成员返回 typeof "unknown"
+//   的怪癖)。v8.7.6 放宽为"成员非空即试",调不起来再回退。
+//   返回 true = every 正常走满;false = 走不起来(调用方回退索引循环,且一个对象都没
+//   消费过,不存在重复访问);抛出 = 回调中途异常 / 没走满(宿主吞异常) → 交调用方原有
+//   的 eLi / eGk 异常路径处理,行为与旧索引循环一致。
+function pfEvery(col, limit, fn) {
+  var m;
+  try { m = col.every; } catch (e0) { return false; } // 访问成员本身可能抛错
+  if (m == null) return false;                        // 没有 every 方法
+  var cnt = 0, ran = false;
+  try {
+    col.every(function (el) { cnt++; ran = true; fn(el); return true; }); // 恒 true:false 会中断
+  } catch (e1) {
+    if (!ran) return false; // 有成员但调不起来(非函数) → 回退,消费为 0 无重复访问
+    throw e1;               // 回调真异常 → 与旧索引循环一样向外抛
+  }
+  if (cnt !== limit) throw new Error("every 未走满"); // 宿主吞异常/提前中断 ⇒ 按异常处理
+  return true;
+}
+
+function runPreflight(c1, c2, c3, c4, c5, c6) {
   var res = { ok: false };
   try {
-    pfEnsureFonts(); // v8.5: 每次检查前同步(数量变化才重探/重建),中途激活/安装的字体不再漏识别
+    // v8.7: 各卡的门控开关,遍历里按它跳过对应工作(关闭的卡完全不读其依赖的属性)
+    var CK = {
+      ab: pfCkOn(c1), hd: pfCkOn(c2), ft: pfCkOn(c3),
+      im: pfCkOn(c4), rs: pfCkOn(c5), ik: pfCkOn(c6)
+    };
+    var allOff = !CK.ab && !CK.hd && !CK.ft && !CK.im && !CK.rs && !CK.ik;
+    // v8.7.1: 诊断计时 —— 页脚显示耗时分解与访问数,用来核实"关掉的卡真的没扫"
+    var t0 = new Date().getTime();
+    if (!allOff) pfEnsureFonts(); // v8.5: 每次检查前同步(数量变化才重探/重建),中途激活/安装的字体不再漏识别
     if (app.documents.length === 0) {
       res.error = "当前没有打开的文档，请先打开需要检查的 AI 文件。";
       return pfReturn(res);
@@ -472,14 +506,43 @@ function runPreflight() {
     res.docName = doc.name;
     try { res.docPath = doc.path.fsName; } catch (e0) { res.docPath = "(文档尚未保存)"; }
 
+    // v8.7: 六卡全关 ⇒ 不读画板、不进树遍历,直接回一份空结果(毫秒级返回)。
+    //   空结构与"扫描后各卡的默认值"同形,前端对关闭的卡只渲染占位,不会读到 undefined。
+    if (allOff) {
+      res.artboards = [];
+      res.activeArtboard = 1;
+      res.colorMode = "CMYK";
+      res.hidden = { layerCount: 0, itemCount: 0, layerNames: [], truncated: false };
+      res.fonts = { totalText: 0, outlined: true, names: [], truncated: false, missingFonts: [] };
+      res.tiny = { count: 0, badCount: 0, samples: [] };
+      res.hiddenText = { count: 0, missingCount: 0, truncated: false };
+      res.images = { linked: [], linkedCount: 0, embeddedCount: 0, missingCount: 0, truncated: false };
+      res.resolution = { total: 0, lowCount: 0, okCount: 0, samples: [], truncated: false };
+      res.symbols = { count: 0, scanned: 0 };
+      res.black = {
+        text: { ok: 0, warn: 0, bad: 0, rgb: 0, spot: 0, mixed: 0, warnSamples: [], badSamples: [] },
+        path: { ok: 0, warn: 0, bad: 0, rgb: 0, spot: 0, mixed: 0, warnSamples: [], badSamples: [], truncated: false, thin: 0, thinSamples: [] },
+        light: { count: 0, samples: [] },
+        overprint: { count: 0, samples: [] }
+      };
+      res.bleed = { supported: false, artboards: [] };
+      res.diag = { ms: { pre: new Date().getTime() - t0, walk: 0, ht: 0, miss: 0,
+                         total: new Date().getTime() - t0 }, ticks: {}, vis: {},
+                   split: { bleed: 0, ink: 0, pruned: 0 },
+                   fine: { type: 0, hid: 0, coll: 0, idx: 0 },
+                   ev: { l: 0, g: 0 } };
+      return pfReturn(res);
+    }
+
     // ---------- 1. 画板尺寸 ----------
     var boards = [];
     var abRects = []; // 各画板 rect(v3.4: 供出血逐画板测量)
     var abBleed = []; // 各画板四向最大超出(pt) + 是否有内容
     var activeIdx = 0;
     try { activeIdx = doc.artboards.getActiveArtboardIndex(); } catch (e1) {}
-    for (var i = 0; i < doc.artboards.length; i++) {
-      var abObj = doc.artboards[i];
+    var abs = doc.artboards; // v8.7.4: 集合取一次,循环里不再重读 doc.artboards
+    for (var i = 0; i < abs.length; i++) {
+      var abObj = abs[i];
       var r = abObj.artboardRect; // [left, top, right, bottom] pt
       abRects.push(r);
       abBleed.push({ top: 0, bottom: 0, left: 0, right: 0, hasContent: false });
@@ -519,17 +582,23 @@ function runPreflight() {
     // 不会到达这里,对象自身 hidden 已在 visitItem 排除,无需再沿 parent 链
     // 向上检查;bounds 先行做重叠预测试(纯算术),任一重叠才读 guides。
     function bleedOf(it, checkGuides) {
+      if (!CK.ab) return; // v8.7: 卡①关 ⇒ 跳过每对象出血实测(卡①唯一的逐对象开销)
+      var tB0 = new Date().getTime(); // v8.7.2: 诊断 —— 累计进 tBleed(页脚"出血/油墨/其他"分解)
       var gb = null;
-      try { gb = it.geometricBounds; } catch (ebg) { return; }
-      if (!gb || gb.length < 4) return;
-      var anyOverlap = false;
-      for (var bq = 0; bq < abRects.length; bq++) {
-        var aq = abRects[bq];
-        if (!(gb[2] < aq[0] || gb[0] > aq[2] || gb[1] < aq[3] || gb[3] > aq[1])) { anyOverlap = true; break; }
+      try { gb = it.geometricBounds; } catch (ebg) { gb = null; }
+      if (gb && gb.length >= 4) {
+        var anyOverlap = false;
+        for (var bq = 0; bq < abRects.length; bq++) {
+          var aq = abRects[bq];
+          if (!(gb[2] < aq[0] || gb[0] > aq[2] || gb[1] < aq[3] || gb[3] > aq[1])) { anyOverlap = true; break; }
+        }
+        if (anyOverlap) {
+          var isGuide = false;
+          if (checkGuides) { try { isGuide = (it.guides === true); } catch (eig) {} }
+          if (!isGuide) measureItem(gb);
+        }
       }
-      if (!anyOverlap) return;
-      if (checkGuides) { try { if (it.guides === true) return; } catch (eig) {} }
-      measureItem(gb);
+      tBleed += new Date().getTime() - tB0;
     }
 
     // ---------- 2. 色彩模式 ----------
@@ -551,17 +620,21 @@ function runPreflight() {
       } catch (ehl) {}
       try {
         var subL = layer.layers;
-        for (var si = 0; si < subL.length; si++) checkLayerVisible(subL[si]);
+        var scLim = subL.length; // v8.7.4: 长度提到循环外
+        for (var si = 0; si < scLim; si++) checkLayerVisible(subL[si]);
       } catch (ehl2) {}
     }
-    try {
+    // v8.7: 卡②关 ⇒ 跳过这次文档级图层可见性补扫(逐层读 visible/name)
+    if (CK.hd) try {
       var allLayers = doc.layers;
-      for (var liH = 0; liH < allLayers.length; liH++) checkLayerVisible(allLayers[liH]);
+      var alLim = allLayers.length; // v8.7.4: 长度提到循环外
+      for (var liH = 0; liH < alLim; liH++) checkLayerVisible(allLayers[liH]);
     } catch (ehl3) {}
 
     // 隐藏"对象"统计: v3.7 起随树遍历顺带统计(每类独立配额 underQuota),
     // 不再用文档级扁平集合;隐藏图层/隐藏组的子树整棵跳过,不再逐个读取。
     res.hidden = hidden;
+    var tSetup = new Date().getTime(); // v8.7.1: 诊断 —— 画板/色彩模式/图层可见性补扫 耗时
 
     // ============================================================
     // 3~5. 树遍历引擎(v3.7): 图层→组→对象 一次递归走完
@@ -636,6 +709,7 @@ function runPreflight() {
     }
 
     function scanPathInk(pi) {
+      var tI0 = new Date().getTime(); // v8.7.2: 诊断 —— 累计进 tInk
       var bp = black.path;
       var nm = pfObjName(pi);
       // v8.5: stroked / fillColor / strokeColor 各读一次后复用 —— 原实现 stroked 读 3 次
@@ -687,6 +761,7 @@ function runPreflight() {
             { src: "path", where: "描边", desc: rsc.light, name: nm }, rsc.light + "|描边|" + nm + "|path", SAMPLE_CAP);
         }
       } catch (e7) {}
+      tInk += new Date().getTime() - tI0;
     }
 
     // ---------- 图片嵌入 + 分辨率 数据结构 ----------
@@ -772,7 +847,7 @@ function runPreflight() {
     }
 
     // 无位图时跳过 XMP 解析(XMP 文本可能很大,解析开销高)
-    var xmpEmbNames = (ris.length > 0) ? xmpEmbeddedNames() : [];
+    var xmpEmbNames = (CK.rs && ris.length > 0) ? xmpEmbeddedNames() : []; // v8.7: 只有卡⑤开才解析(XMP 文本可能很大)
     var xmpSeq = 0;      // 顺序兜底指针
     var rasterIdx = 0;   // 已处理的嵌入位图计数
     var placedIdx = 0;   // 已处理的链接图计数
@@ -791,6 +866,16 @@ function runPreflight() {
     //      v4.8 修复: 原先任何类超限都会误置 hidden.truncated,导致隐藏对象
     //      卡错误显示"仅扫描前 3000 个")。
     var scanTicks = {};
+    // v8.7.1: 诊断 —— 每类对象的**实际访问数**(不受开关/配额影响),与 scanTicks
+    //   (真正进入检查分支的数)一起随 res.diag 下发,供页脚核实"关掉的卡是否真的没扫"
+    var vN = {};
+    // v8.7.2: 诊断 —— 出血/油墨累计耗时 + 出血组级剪枝统计(页脚分解行)
+    var tBleed = 0, tInk = 0, prunedG = 0;
+    // v8.7.3: 细分计时 —— 把"遍历·其他"拆成 typename 读 / hidden 读 / 列表访问
+    //   (pageItems+每轮 length) / 对象索引取用 4 项,定位单对象 ~0.86ms 的构成。
+    //   每 8 个对象采样 1 次 ×8 外推(tCnt 或循环下标),Date 调用降到 1/8,开销可忽略。
+    var tType = 0, tHid = 0, tColl = 0, tIdx = 0, tCnt = 0;
+    var evL = 0, evG = 0; // v8.7.6: every 路径标注 1=生效 0=未生效/未走到 -1=尝试后异常
     function underQuota(cat) {
       var n = scanTicks[cat] || 0;
       if (n >= MAX_SCAN) return false;
@@ -801,39 +886,104 @@ function runPreflight() {
     // ---------- 树遍历 ----------
     // 单个对象: 按 typename 分派(可见性已由 walkLayer 的图层过滤保证,
     // 无需再传 vis 标志 —— v4.8 清理死参数)
-    function visitItem(it, depth) {
+    function visitItem(it, depth, skipBleed) {
       if (depth > 64) return; // 防异常深嵌套导致栈溢出(超过深度放弃下钻)
+      tCnt++;
+      var tSmp = ((tCnt & 7) === 0); // v8.7.3: 每 8 个对象采样计时 1 次
       var tn = "";
-      try { tn = it.typename; } catch (eT) { return; }
+      var tT0 = tSmp ? new Date().getTime() : 0;
+      try { tn = it.typename; } catch (eT) {
+        if (tSmp) tType += (new Date().getTime() - tT0) * 8;
+        return;
+      }
+      if (tSmp) tType += (new Date().getTime() - tT0) * 8;
 
       // 组: 隐藏组整棵子树跳过;可见组继续下钻
       if (tn === "GroupItem") {
         var gHidden = false;
+        var tH0 = tSmp ? new Date().getTime() : 0;
         try { gHidden = (it.hidden === true); } catch (eGv) {}
+        if (tSmp) tHid += (new Date().getTime() - tH0) * 8; // v8.7.3: 诊断
         if (gHidden) {
           sawHidden = true;   // v8.1: 见到隐藏组 ⇒ 内部可能有隐藏文字
           if (underQuota("group")) hidden.itemCount++;
           else hidden.truncated = true; // v4.8: 隐藏组超配额只挂 hidden 自己的截断
           return;
         }
+        vN.group = (vN.group || 0) + 1; // v8.7.1: 诊断计数
         // v8.6: 组级出血测量改为"只在子项读不出来时兜底" —— 原来无条件先测一次, 而组的
         //   geometricBounds 是纯几何量(**含隐藏子项**): 可见组里若有隐藏子项越界, 组级测量
         //   会把它的超出算进出血(measureItem 每边取 max) ⇒ 可能**漏报出血不足**, 与"隐藏
         //   内容不参与印刷统计"的口径相悖。可见子项本就各自测过(取 max, 天然幂等) ⇒ 正常
         //   路径上组级测量既冗余又有害; 只有读不到子项时它才是唯一测量, 那时才该兜。
+        var childSkip = skipBleed;
         try {
+          var tC0 = tSmp ? new Date().getTime() : 0;
           var kids = it.pageItems;
-          for (var k = 0; k < kids.length; k++) visitItem(kids[k], depth + 1);
+          var kLim = kids.length; // v8.7.4: 长度只读一次 —— 原先剪枝条件+循环条件各重读一轮
+          if (tSmp) tColl += (new Date().getTime() - tC0) * 8; // v8.7.3: 诊断
+          // v8.7.2: 出血组级剪枝 —— 组 geometricBounds 是子项 bounds 的并集(含隐藏子项,
+          //   故恒 ≥ 可见子项)。若组 bounds 完整落入某个画板、且与其他画板均不相交, 则每个
+          //   可见子项也必然完整落在该画板内 ⇒ 四向超出量恒 ≤0、不会刷新任何极值; 唯一会
+          //   写入的状态是该画板的 hasContent —— 这里直接补写, 结果与逐子项测量完全一致。
+          //   收益: 组内成千上万个路径不再逐个读 geometricBounds —— AI 要逐段算贝塞尔包围盒,
+          //   是本面板最大的单项耗时(v8.7.2 实测: 9967 路径 ≈ 9 秒)。
+          //   裁剪组的越界部分本来就不输出, 跳过它不影响印前结论。
+          if (!childSkip && CK.ab && kLim > 0) {
+            var ggb = null;
+            try { ggb = it.geometricBounds; } catch (eGg) {}
+            if (ggb && ggb.length === 4) {
+              var inA = -1, canPrune = true;
+              for (var gbi = 0; gbi < abRects.length; gbi++) {
+                var gr = abRects[gbi];
+                if (ggb[0] >= gr[0] && ggb[2] <= gr[2] && ggb[1] <= gr[1] && ggb[3] >= gr[3]) {
+                  if (inA === -1) inA = gbi; // 完整落入该画板
+                } else if (!(ggb[2] < gr[0] || ggb[0] > gr[2] || ggb[1] < gr[3] || ggb[3] > gr[1])) {
+                  canPrune = false; // 与某画板部分相交(可能跨界)⇒ 子项必须逐个测
+                  break;
+                }
+              }
+              if (canPrune && inA !== -1) {
+                childSkip = true;
+                prunedG++;
+                for (var gh = 0; gh < abRects.length; gh++) {
+                  var ghr = abRects[gh];
+                  if (ggb[0] >= ghr[0] && ggb[2] <= ghr[2] && ggb[1] <= ghr[1] && ggb[3] >= ghr[3])
+                    abBleed[gh].hasContent = true; // 复刻"子项落在画板内"必写的 hasContent
+                }
+              }
+            }
+          }
+            // v8.7.4: 长度已提到循环外,循环里不再碰 kids.length
+          // v8.7.6(实验②): every 优先(宿主内部递交对象,免每次索引);
+          //   false ⇒ 回退索引循环(消费为 0 无重复);异常 ⇒ 抛给 eGk(同旧版)
+          evG = -1;
+          var usedEvG = pfEvery(kids, kLim, function (kid) {
+            visitItem(kid, depth + 1, childSkip);
+          });
+          evG = usedEvG ? 1 : 0;
+          if (!usedEvG) {
+            // 索引回退(与 v8.7.4 完全一致): 索引取用每 8 轮采样计时(v8.7.3 诊断)
+            for (var k = 0; k < kLim; k++) {
+              var kSmp = ((k & 7) === 0);
+              var tI0 = kSmp ? new Date().getTime() : 0;
+              var kid = kids[k];
+              if (kSmp) tIdx += (new Date().getTime() - tI0) * 8;
+              visitItem(kid, depth + 1, childSkip);
+            }
+          }
         } catch (eGk) {
           sawHidden = true;   // v8.1: 组内读不到 ⇒ 不敢断言"无隐藏"
-          bleedOf(it, false); // v5.25 兜底: 子项没下钻成, 退回组级 bounds, 别漏测
+          if (!childSkip) bleedOf(it, false); // v5.25 兜底: 子项没下钻成, 退回组级 bounds, 别漏测
         }
         return;
       }
 
       // 对象自身隐藏(Ctrl+3)
       var selfHidden = false;
+      var tH1 = tSmp ? new Date().getTime() : 0;
       try { selfHidden = (it.hidden === true); } catch (eH) {}
+      if (tSmp) tHid += (new Date().getTime() - tH1) * 8; // v8.7.3: 诊断
 
       var cat = "";
       if (tn === "TextFrame") cat = "text";
@@ -844,101 +994,117 @@ function runPreflight() {
       else if (tn === "RasterItem") cat = "raster";
       else if (tn === "PlacedItem") cat = "placed";
       if (cat === "") return;
+      vN[cat] = (vN[cat] || 0) + 1; // v8.7.1: 诊断计数(可见+隐藏都算)
 
       // 隐藏对象统计(每类独立配额);隐藏内容不输出 → 跳过一切印刷相关检查
       if (selfHidden) {
         sawHidden = true;   // v8.1: 见到隐藏对象(可能是隐藏文本框) ⇒ 需保留隐藏文字扫描
+        vN.hid = (vN.hid || 0) + 1; // v8.7.1: 诊断计数(整类跳过)
         if (underQuota(cat)) hidden.itemCount++;
         else hidden.truncated = true; // v5.6/B1: 超配额也必须挂截断标记,否则隐藏数被低估且界面无提示
         return;
       }
 
       if (tn === "TextFrame") {
-        bleedOf(it, false); // v5.25: 出血先于配额(配额只截断统计,不截断出血测量)
+        if (!skipBleed) bleedOf(it, false); // v5.25: 出血先于配额(配额只截断统计,不截断出血测量)
+        // v8.7: 卡③(字体)与卡⑥(文字油墨/叠印)都要处理文本帧;两卡都关 ⇒ 只留出血测量
+        if (!CK.ft && !CK.ik) return;
         // v4.8: 配额检查前置,totalText 只统计实际扫描数(原在配额前++,超限仍虚增)
-        if (!underQuota("text")) { fonts.truncated = true; return; }
-        fonts.totalText++;
+        if (!underQuota("text")) { if (CK.ft) fonts.truncated = true; return; }
+        if (CK.ft) fonts.totalText++;
         // v8.5: characterAttributes 只解析一次 —— 原实现每步都重新解析
         //   textRange.characterAttributes(字体名 / 字号 / 填充色给油墨 / 填充色给极浅 / 叠印 共 5 遍),
         //   同一帧要付 5 次链解析的跨桥成本;现在一次取回 ca 全程复用。
         var ca = null;
         try { ca = it.textRange.characterAttributes; } catch (eCa) { ca = null; }
         var fn = "";
-        try { fn = ca.textFont.name; }
-        catch (e3) { fn = "(混合字体)"; }
-        if (fn && !seen[fn]) { seen[fn] = true; fonts.names.push(fn); }
+        if (CK.ft) {
+          try { fn = ca.textFont.name; }
+          catch (e3) { fn = "(混合字体)"; }
+          if (fn && !seen[fn]) { seen[fn] = true; fonts.names.push(fn); }
+        }
         // v8.6: 片段只取一次 —— pfSnippet 是一次跨桥读(contents)+正则, 原来本帧最多被调
         //   4 次(极小字号/油墨入桶/极浅样本/叠印样本); 而"油墨入桶"那条是无条件执行的,
         //   所以提前取一次不增加干净帧的成本, 出问题的帧则省下 1~3 次读。
-        var snip = pfSnippet(it);
-        // v5.15: 极小字号检测(混合字号帧读 size 会抛异常,跳过不误报)
-        try {
-          var fsz = ca.size;
-          if (typeof fsz === "number" && isFinite(fsz) && fsz > 0 && fsz < TINY_PT) {
-            tiny.count++;
-            if (fsz < TINY_BAD_PT) tiny.badCount++; // v6.8: <5pt 额外计入重度(嵌套)
-            if (tiny.samples.length < 5) tiny.samples.push({ t: snip, pt: pfRound(fsz) });
-          }
-        } catch (eSz) {}
-        // v8.5: 填充色一次读出"油墨总量 + 极浅"(等价于原 pfTextInk + pfLightChannel 两次读数);
-        //   ca 解析失败或混合色仍按旧口径记 mixed。
-        var rtx = null, fcTx = null;
-        if (!ca) { rtx = { total: -1, type: "mixed", desc: "混合颜色" }; }
-        else {
-          try { fcTx = ca.fillColor; } catch (eFc) { fcTx = null; }
-          try { rtx = pfInkLightBoth(fcTx); } catch (eTi) { rtx = { total: -1, type: "mixed", desc: "混合颜色" }; }
-        }
-        if (rtx) inkBucket(black.text, rtx, snip, "填充");
-        // v6.2: 色值极浅(文字填充色)
-        // v7.8: 按不同色值收(与图形侧同一个池),n 累加全量次数
-        if (rtx && rtx.light) {
-          black.light.count++;
-          var ltfName = snip;
-          pfSampleAdd(black.light.samples,
-            { src: "text", where: "填充", desc: rtx.light, name: ltfName },
-            rtx.light + "|填充|" + ltfName + "|text", SAMPLE_CAP);
-        }
-        // v8.3: 叠印检查(文字侧)——**只能走字符级**,真机 28.0.0 上 TextFrame 没有
-        //   pageItem 级 fillOverprint/strokeOverprint(探针 v1 实测为"缺失")。
-        //   两个布尔读很便宜(characterAttributes 本来就已读过),命中才取色值 + 片段。
-        //   v8.5: 复用同一个 ca,不再重新解析。
-        try {
-          var ovf = pfCharOvpFill(ca), ovs = pfCharOvpStroke(ca);
-          if (ovf || ovs) {
-            if (ovf) pfOvpAdd("text", "填充", pfOvpDesc(fcTx), snip);
-            if (ovs) {
-              // v8.6: 描边色只在真的命中叠印描边时才读(多数帧不描边, 这一读可省)
-              var scTx = null; try { scTx = ca.strokeColor; } catch (eSc) {}
-              pfOvpAdd("text", "描边", pfOvpDesc(scTx), snip);
+        // v8.7: 只有卡③开才读 contents —— 卡3关卡6开时样本名留空,省掉这次长串跨桥读。
+        var snip = CK.ft ? pfSnippet(it) : "";
+        if (CK.ft) {
+          // v5.15: 极小字号检测(混合字号帧读 size 会抛异常,跳过不误报)
+          try {
+            var fsz = ca.size;
+            if (typeof fsz === "number" && isFinite(fsz) && fsz > 0 && fsz < TINY_PT) {
+              tiny.count++;
+              if (fsz < TINY_BAD_PT) tiny.badCount++; // v6.8: <5pt 额外计入重度(嵌套)
+              if (tiny.samples.length < 5) tiny.samples.push({ t: snip, pt: pfRound(fsz) });
             }
+          } catch (eSz) {}
+        }
+        // v8.7: 以下"油墨总量 / 色版极浅 / 叠印"全部属卡⑥,关掉时一个色值都不读
+        if (CK.ik) {
+          // v8.5: 填充色一次读出"油墨总量 + 极浅"(等价于原 pfTextInk + pfLightChannel 两次读数);
+          //   ca 解析失败或混合色仍按旧口径记 mixed。
+          var rtx = null, fcTx = null;
+          if (!ca) { rtx = { total: -1, type: "mixed", desc: "混合颜色" }; }
+          else {
+            try { fcTx = ca.fillColor; } catch (eFc) { fcTx = null; }
+            try { rtx = pfInkLightBoth(fcTx); } catch (eTi) { rtx = { total: -1, type: "mixed", desc: "混合颜色" }; }
           }
-        } catch (eOvp) {}
+          if (rtx) inkBucket(black.text, rtx, snip, "填充");
+          // v6.2: 色值极浅(文字填充色)
+          // v7.8: 按不同色值收(与图形侧同一个池),n 累加全量次数
+          if (rtx && rtx.light) {
+            black.light.count++;
+            var ltfName = snip;
+            pfSampleAdd(black.light.samples,
+              { src: "text", where: "填充", desc: rtx.light, name: ltfName },
+              rtx.light + "|填充|" + ltfName + "|text", SAMPLE_CAP);
+          }
+          // v8.3: 叠印检查(文字侧)——**只能走字符级**,真机 28.0.0 上 TextFrame 没有
+          //   pageItem 级 fillOverprint/strokeOverprint(探针 v1 实测为"缺失")。
+          //   两个布尔读很便宜(characterAttributes 本来就已读过),命中才取色值 + 片段。
+          //   v8.5: 复用同一个 ca,不再重新解析。
+          try {
+            var ovf = pfCharOvpFill(ca), ovs = pfCharOvpStroke(ca);
+            if (ovf || ovs) {
+              if (ovf) pfOvpAdd("text", "填充", pfOvpDesc(fcTx), snip);
+              if (ovs) {
+                // v8.6: 描边色只在真的命中叠印描边时才读(多数帧不描边, 这一读可省)
+                var scTx = null; try { scTx = ca.strokeColor; } catch (eSc) {}
+                pfOvpAdd("text", "描边", pfOvpDesc(scTx), snip);
+              }
+            }
+          } catch (eOvp) {}
+        }
         return;
       }
       if (tn === "PathItem") {
-        bleedOf(it, true);  // v5.25: 出血先于配额(配额只截断统计,不截断出血测量)
+        if (!skipBleed) bleedOf(it, true);  // v5.25: 出血先于配额(配额只截断统计,不截断出血测量)
+        if (!CK.ik) return; // v8.7: 卡⑥关 ⇒ 路径一个颜色/叠印/描边属性都不读(最大的逐对象开销)
         if (!underQuota("path")) { black.path.truncated = true; return; }
         scanPathInk(it);
         return;
       }
       if (tn === "CompoundPathItem") {
-        bleedOf(it, true);  // v5.25: 出血先于配额(配额只截断统计,不截断出血测量)
+        if (!skipBleed) bleedOf(it, true);  // v5.25: 出血先于配额(配额只截断统计,不截断出血测量)
+        if (!CK.ik) return; // v8.7: 同上,复合路径只取首组件色给卡⑥
         if (!underQuota("compound")) { black.path.truncated = true; return; }
         try { scanPathInk(it.pathItems[0]); } catch (eC) {}
         return;
       }
       if (tn === "MeshItem") {
-        bleedOf(it, false); // v5.25: 出血先于配额(配额只截断统计,不截断出血测量)
+        if (!skipBleed) bleedOf(it, false); // v5.25: 出血先于配额(配额只截断统计,不截断出血测量)
         if (!underQuota("mesh")) return;
         return;
       }
       if (tn === "SymbolItem") {
-        bleedOf(it, false); // v5.25: 出血先于配额(配额只截断统计,不截断出血测量)
+        if (!skipBleed) bleedOf(it, false); // v5.25: 出血先于配额(配额只截断统计,不截断出血测量)
         if (!underQuota("symbol")) return;
         // v4.8: 下钻 Symbol 定义源,扫描内部对象(缺失字体/分辨率/油墨等)
         // 多个实例引用同一符号时会重复扫描(与"实际输出内容"口径一致);
         // 定义源不可访问时静默跳过,仅统计数量
         symbols.count++;
+        // v8.7: 符号内部对象只喂卡③④⑤⑥ —— 这些卡都关时只计数、不下钻
+        if (!CK.ft && !CK.im && !CK.rs && !CK.ik) return;
         try {
           var symDef = null;
           try { symDef = it.symbol; } catch (eSD) {}
@@ -949,45 +1115,54 @@ function runPreflight() {
           }
           if (symSrc && symSrc.pageItems) {
             var symKids = symSrc.pageItems;
-            for (var sk = 0; sk < symKids.length; sk++) visitItem(symKids[sk], depth + 1);
+            var syLim = symKids.length; // v8.7.4: 长度提到循环外
+            for (var sk = 0; sk < syLim; sk++) visitItem(symKids[sk], depth + 1, skipBleed);
             symbols.scanned++;
           }
         } catch (eSym) {}
         return;
       }
       if (tn === "RasterItem") {
-        bleedOf(it, false); // v5.25: 出血先于配额(配额只截断统计,不截断出血测量)
+        if (!skipBleed) bleedOf(it, false); // v5.25: 出血先于配额(配额只截断统计,不截断出血测量)
+        if (!CK.im && !CK.rs) return; // v8.7: 卡④⑤都关 ⇒ 嵌入位图一个属性都不读
         if (!underQuota("raster")) { reso.truncated = true; imgs.truncated = true; return; }
-        imgs.embeddedCount++; // v5.7: 只统计可见的嵌入位图
-        resoCheck(it, embName(it, rasterIdx, "(嵌入位图" + (rasterIdx + 1) + ")"));
+        if (CK.im) imgs.embeddedCount++; // v5.7: 只统计可见的嵌入位图
+        if (CK.rs) resoCheck(it, embName(it, rasterIdx, "(嵌入位图" + (rasterIdx + 1) + ")"));
         rasterIdx++;
         return;
       }
       // PlacedItem
-      bleedOf(it, false); // v5.25: 出血先于配额(配额只截断统计,不截断出血测量)
+      if (!skipBleed) bleedOf(it, false); // v5.25: 出血先于配额(配额只截断统计,不截断出血测量)
+      if (!CK.im && !CK.rs) return; // v8.7: 卡④⑤都关 ⇒ 链接图一个属性都不读
       if (!underQuota("placed")) { reso.truncated = true; imgs.truncated = true; return; }
-      imgs.linkedCount++; // v5.7: 只统计可见的链接图(隐藏链接图不参与印刷,不计入)
-      // v5.15: 源文件存在性——被移动/改名/未随包拷贝的链接 AI 输出时会用
-      // 低清预览替代;仅 file.exists 明确为 false 才计缺失,读不到不算
-      var lkMissing = false;
-      try { lkMissing = (it.file.exists === false); } catch (eEx2) {}
-      if (lkMissing) imgs.missingCount++;
+      // v8.7: 计数/存在性/清单属卡④,关掉时跳过(file.exists 是一次跨桥读)
+      if (CK.im) {
+        imgs.linkedCount++; // v5.7: 只统计可见的链接图(隐藏链接图不参与印刷,不计入)
+        // v5.15: 源文件存在性——被移动/改名/未随包拷贝的链接 AI 输出时会用
+        // 低清预览替代;仅 file.exists 明确为 false 才计缺失,读不到不算
+        var lkMissing = false;
+        try { lkMissing = (it.file.exists === false); } catch (eEx2) {}
+        if (lkMissing) imgs.missingCount++;
+      }
       // 文件路径只读一次: 前 5 个用于展示(v6.5: 50→5,列表统一"仅列前 5"),同时取扩展名判断位图/矢量
+      // v8.7: 卡⑤要扩展名、卡④要路径 —— 进到本分支说明至少开了一个,路径照读
       var fp = "";
       try { fp = String(it.file.fsName); } catch (e11) {}
-      if (imgs.linked.length < 5) {
+      if (CK.im && imgs.linked.length < 5) {
         imgs.linked.push({ name: it.name || "(链接图)", file: fp || "(无法读取路径)", missing: lkMissing });
       }
       // 矢量链接(PDF/AI/EPS/SVG)没有有效分辨率: identity 矩阵会被算成
       // 72ppi 而误报"低于300ppi",只对位图扩展名检查(v3.6);
       // 扩展名拿不到时保守起见仍检查(与旧版一致)
-      var extB = "";
-      var dotB = fp.lastIndexOf(".");
-      if (dotB >= 0) extB = fp.substring(dotB + 1).toLowerCase();
-      var isBmp = (extB === "tif" || extB === "tiff" || extB === "jpg" || extB === "jpeg" ||
-                   extB === "png" || extB === "psd" || extB === "bmp" || extB === "gif");
-      if (isBmp || extB === "") {
-        resoCheck(it, imgName(it, "(链接图" + (placedIdx + 1) + ")"));
+      if (CK.rs) {
+        var extB = "";
+        var dotB = fp.lastIndexOf(".");
+        if (dotB >= 0) extB = fp.substring(dotB + 1).toLowerCase();
+        var isBmp = (extB === "tif" || extB === "tiff" || extB === "jpg" || extB === "jpeg" ||
+                     extB === "png" || extB === "psd" || extB === "bmp" || extB === "gif");
+        if (isBmp || extB === "") {
+          resoCheck(it, imgName(it, "(链接图" + (placedIdx + 1) + ")"));
+        }
       }
       placedIdx++;
     }
@@ -998,17 +1173,37 @@ function runPreflight() {
       try { if (ly.visible === false) { sawHidden = true; return; } } catch (eLv) { sawHidden = true; return; }
       try {
         var subs = ly.layers;
-        for (var si = 0; si < subs.length; si++) walkLayer(subs[si], depth + 1);
+        var sLim = subs.length; // v8.7.4: 长度提到循环外(与 items/kids 同口径)
+        for (var si = 0; si < sLim; si++) walkLayer(subs[si], depth + 1);
       } catch (eLs) { sawHidden = true; }   // v8.1: 子图层读不到 ⇒ 不敢断言"无隐藏"
       try {
+        var tC1 = new Date().getTime(); // v8.7.3: 诊断 —— 图层对象列表取用(每层仅一次,直接计)
         var items = ly.pageItems;
-        for (var ii = 0; ii < items.length; ii++) visitItem(items[ii], 0);
+        var iLim = items.length;         // v8.7.4: 长度只读一次(原在循环条件里每轮重读,占遍历 65%)
+        tColl += new Date().getTime() - tC1;
+        // v8.7.6(实验②): every 优先(宿主内部递交对象,免每次 0.25ms 索引);
+        //   false ⇒ 回退索引循环(消费为 0 无重复);异常 ⇒ 抛给 eLi(同旧版)
+        evL = -1;
+        var usedEvL = pfEvery(items, iLim, function (itm) { visitItem(itm, 0, false); });
+        evL = usedEvL ? 1 : 0;
+        if (!usedEvL) {
+          // 索引回退(与 v8.7.4 完全一致): 索引取用每 8 轮采样计时(v8.7.3 诊断)
+          for (var ii = 0; ii < iLim; ii++) {
+            var iSmp = ((ii & 7) === 0);
+            var tI1 = iSmp ? new Date().getTime() : 0;
+            var itm = items[ii];
+            if (iSmp) tIdx += (new Date().getTime() - tI1) * 8;
+            visitItem(itm, 0, false);
+          }
+        }
       } catch (eLi) { sawHidden = true; }   // v8.1: 对象列表读不到 ⇒ 同上
     }
     try {
       var topLayers = doc.layers;
-      for (var liW = 0; liW < topLayers.length; liW++) walkLayer(topLayers[liW], 0);
+      var tLim = topLayers.length; // v8.7.4: 长度提到循环外
+      for (var liW = 0; liW < tLim; liW++) walkLayer(topLayers[liW], 0);
     } catch (eW) { sawHidden = true; }      // v8.1: 顶层图层读不到 ⇒ 同上
+    var tWalk = new Date().getTime(); // v8.7.1: 诊断 —— 树遍历(含出血/油墨/字体/分辨率)耗时
 
     // ---------- v5.21: 隐藏文字统计 ----------
     // 树遍历跳过隐藏子树(提速优化),隐藏文字因此不进 totalText/缺失检测;
@@ -1021,7 +1216,8 @@ function runPreflight() {
     //   才可能存在"隐藏文字";一个都没遇到时隐藏文字必然为 0,于是这次"文档级 textFrames
     //   全量扫描(封顶 500 帧,每帧还都要沿 parent 链判可见性)"可以整段跳过。
     //   ⚠ 只要有任何读取异常都置 sawHidden=true,宁可多扫不多漏(见 walkLayer/visitItem)。
-    if (sawHidden) {
+    // v8.7: 隐藏文字统计属卡③ —— 字体卡关掉时整段跳过(这次补扫最多要遍历 500 帧)。
+    if (sawHidden && CK.ft) {
       try {
         var dtfsAll = doc.textFrames;
         var capHT = dtfsAll.length > 500 ? 500 : dtfsAll.length;
@@ -1044,10 +1240,12 @@ function runPreflight() {
         if (dtfsAll.length > capHT) hiddenText.truncated = true;
       } catch (eHT) {}
     }
+    var tHT = new Date().getTime(); // v8.7.1: 诊断 —— 隐藏文字补扫耗时
 
     // ---------- 扫描后处理: 缺失字体 / 结果挂载 ----------
     // 检测缺失字体: 与系统字体表对比(表已缓存于全局 __pfSysFonts,跨检查复用)
-    try {
+    // v8.7: 属卡③ —— 字体卡关掉时跳过(逐字体查表也要跨桥读)
+    if (CK.ft) try {
       var missMap = {};
       // v8.5: 门控改为"探测已启用 或 全表快照可用" —— 按需探测模式不建全表,
       //   旧门控(__pfSysFontsReady)会恒为 false ⇒ 缺失检测会整体失效。
@@ -1060,6 +1258,7 @@ function runPreflight() {
       for (var mk in missMap) fonts.missingFonts.push(mk);
       fonts.missingFonts.sort(); // v5.6/B4: 固定字母序,同一文档每次检查列表顺序一致
     } catch (eMiss) {}
+    var tMiss = new Date().getTime(); // v8.7.1: 诊断 —— 缺失字体查表耗时
     // v5.16: v5.10~v5.12 的诊断量(res.fontDiag/文档级扫描/命中明细)已随根因
     // 确诊(占位条目)整体移除,检查耗时回到 v5.9 水平;占位条目过滤(pfIsFontMissing)保留。
     fonts.outlined = (fonts.totalText === 0);
@@ -1078,43 +1277,56 @@ function runPreflight() {
     // v4.5 起四边全判: 每条边的实测出血独立检查,任一边 <3mm 即列入不足清单。
     // 内容未贴到的边出血按 0 计(内容没超出画板边缘就没有出血)——例如画板只有
     // 左上角贴到、右下角留白,右下 0mm 也会报,不再因为"贴到的边达标"而整体放行。
-    bleed.supported = true;
-    for (var bs = 0; bs < abBleed.length; bs++) {
-      var stB = abBleed[bs];
-      var shortEdges = [];
-      // 收集不足边: 实测出血 < 3mm(含 v4.1 的 0.05mm 容差,防 8.5pt=2.9986mm 误报)
-      var pushShort = function (edge, pt) {
-        if (pt * PT2MM < BLEED_MIN_MM - 0.05) shortEdges.push({ edge: edge, mm: pfRound(pt * PT2MM) });
-      };
-      if (stB.hasContent) {
-        pushShort("上", stB.top);
-        pushShort("下", stB.bottom);
-        pushShort("左", stB.left);
-        pushShort("右", stB.right);
-      } else {
-        // v4.2: 空画板四方向出血为 0,全部不足
-        shortEdges = [{ edge: "上", mm: 0 }, { edge: "下", mm: 0 }, { edge: "左", mm: 0 }, { edge: "右", mm: 0 }];
+    // v8.7: 卡①关 ⇒ 跳过出血汇总(bleed.supported 保持 false,前端对关闭的卡只渲染占位)
+    if (CK.ab) {
+      bleed.supported = true;
+      for (var bs = 0; bs < abBleed.length; bs++) {
+        var stB = abBleed[bs];
+        var shortEdges = [];
+        // 收集不足边: 实测出血 < 3mm(含 v4.1 的 0.05mm 容差,防 8.5pt=2.9986mm 误报)
+        var pushShort = function (edge, pt) {
+          if (pt * PT2MM < BLEED_MIN_MM - 0.05) shortEdges.push({ edge: edge, mm: pfRound(pt * PT2MM) });
+        };
+        if (stB.hasContent) {
+          pushShort("上", stB.top);
+          pushShort("下", stB.bottom);
+          pushShort("左", stB.left);
+          pushShort("右", stB.right);
+        } else {
+          // v4.2: 空画板四方向出血为 0,全部不足
+          shortEdges = [{ edge: "上", mm: 0 }, { edge: "下", mm: 0 }, { edge: "左", mm: 0 }, { edge: "右", mm: 0 }];
+        }
+        var isInsufficient = shortEdges.length > 0;
+        // 最差边(兜底展示用): 不足边中数值最小的一条
+        var worstEdge = "";
+        var worstMm = Infinity;
+        for (var we = 0; we < shortEdges.length; we++) {
+          if (shortEdges[we].mm < worstMm) { worstMm = shortEdges[we].mm; worstEdge = shortEdges[we].edge; }
+        }
+        var minPt = Math.min(stB.top, stB.bottom, stB.left, stB.right); // 四边最小(pt)
+        bleed.artboards.push({
+          name: boards[bs].name,
+          top: pfRound(stB.top * PT2MM), bottom: pfRound(stB.bottom * PT2MM),
+          left: pfRound(stB.left * PT2MM), right: pfRound(stB.right * PT2MM),
+          minMm: pfRound(minPt * PT2MM),
+          hasContent: stB.hasContent,
+          worstEdge: worstEdge,
+          shortEdges: shortEdges,   // v4.5: 该画板所有 <3mm 的边 [{edge, mm}]
+          insufficient: isInsufficient
+        });
       }
-      var isInsufficient = shortEdges.length > 0;
-      // 最差边(兜底展示用): 不足边中数值最小的一条
-      var worstEdge = "";
-      var worstMm = Infinity;
-      for (var we = 0; we < shortEdges.length; we++) {
-        if (shortEdges[we].mm < worstMm) { worstMm = shortEdges[we].mm; worstEdge = shortEdges[we].edge; }
-      }
-      var minPt = Math.min(stB.top, stB.bottom, stB.left, stB.right); // 四边最小(pt)
-      bleed.artboards.push({
-        name: boards[bs].name,
-        top: pfRound(stB.top * PT2MM), bottom: pfRound(stB.bottom * PT2MM),
-        left: pfRound(stB.left * PT2MM), right: pfRound(stB.right * PT2MM),
-        minMm: pfRound(minPt * PT2MM),
-        hasContent: stB.hasContent,
-        worstEdge: worstEdge,
-        shortEdges: shortEdges,   // v4.5: 该画板所有 <3mm 的边 [{edge, mm}]
-        insufficient: isInsufficient
-      });
     }
     res.bleed = bleed;
+    // v8.7.1: 诊断结果 —— 页脚显示。ticks=path/text 等真正进入检查分支的次数
+    //   (关掉的卡对应 ticks 不增长),vis=树遍历访问到的各类对象总数。
+    res.diag = {
+      ms: { pre: tSetup - t0, walk: tWalk - tSetup, ht: tHT - tWalk,
+            miss: tMiss - tHT, total: new Date().getTime() - t0 },
+      ticks: scanTicks, vis: vN,
+      split: { bleed: tBleed, ink: tInk, pruned: prunedG },
+      fine: { type: tType, hid: tHid, coll: tColl, idx: tIdx },
+      ev: { l: evL, g: evG } // v8.7.6: every 路径 1=生效 0=回退/未走到 -1=尝试后异常
+    };
 
     return pfReturn(res);
   } catch (err) {

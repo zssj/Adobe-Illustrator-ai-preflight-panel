@@ -2,11 +2,11 @@
 (function () {
   "use strict";
 
-  var JS_BUILD = "20260922-4";
+  var JS_BUILD = "20260929-8";
   // 必须与 jsx/preflight.jsx 里的 PF_BUILD 保持一致。
   // JSX 每次返回都会带上它的构建号,前端据此判断 ExtendScript 引擎里
   // 加载的是不是当前版本 —— 不一致就强制 $.evalFile 重载(见 execJsx)。
-  var JSX_BUILD = "8.6";
+  var JSX_BUILD = "8.7.6";
 
   // 全局错误捕获: 把任何未捕获异常显示到面板,便于定位"空白"问题
   window.onerror = function (msg, url, line, col) {
@@ -160,11 +160,39 @@
       chip(chipLevel || level, chipText) + (extraChip ? extraChip : "") + '</span></div><div class="card-body">' + bodyHtml + "</div></div>";
   }
 
+  // v8.7: 已关闭卡片的灰化占位(开关行去掉勾选的卡,该卡本轮不检查)
+  function offCard(title) {
+    return '<div class="card card-off"><div class="card-head"><span>' + esc(title) +
+      '</span><span class="chips"><span class="chip off">已关闭</span></span></div>' +
+      '<div class="card-body"><span class="dim">本轮未检查。在上方勾选后点「开始检查」。</span></div></div>';
+  }
+
   // v7.0: 标题行 + 右侧样本截断提示(与标题同一行、右对齐、不带括号)
   // 不带"共 N"是因为总数已经在标题的计数里,避免同一行重复报数
   function rowHead(leftHtml, hintText) {
     return '<div class="row-head"><span class="row-t">' + leftHtml + "</span>" +
       (hintText ? '<span class="row-h">' + esc(hintText) + "</span>" : "") + "</div>";
+  }
+
+  // ---------- v8.7: 六卡检查开关 ----------
+  // 卡片顺序固定为 ①画板出血 ②隐藏 ③字体 ④嵌入 ⑤分辨率 ⑥油墨叠印描边(下标 0~5)。
+  // CARD_CK  = 当前勾选状态(用户改动即更新,并写 localStorage)。
+  // SCAN_CK  = 本轮检查实际使用的状态快照 —— 渲染按它判定占位卡,避免"扫描后
+  //            又改了勾选"导致某张卡拿旧数据/空数据当新结果显示。
+  // 改动勾选不自动重扫,提示语写在开关行旁,下次点「开始检查」生效。
+  var CARD_CK = [true, true, true, true, true, true];
+  var SCAN_CK = null;
+  try {
+    var ckSaved = localStorage.getItem("pf_cards");
+    if (ckSaved !== null && /^[01]{6}$/.test(ckSaved)) {
+      for (var ckI = 0; ckI < 6; ckI++) CARD_CK[ckI] = ckSaved.charAt(ckI) === "1";
+    }
+  } catch (eCK) {}
+
+  function ckArgs() {
+    var a = [], i;
+    for (i = 0; i < 6; i++) a.push(CARD_CK[i] ? 1 : 0);
+    return a.join(",");
   }
 
   // ---------- 主流程 ----------
@@ -192,6 +220,8 @@
     $("foot").innerHTML = "";
 
     var timedOut = false;
+    // v8.7: 本轮使用的开关快照 —— 渲染按它决定哪些卡置灰(与传给 jsx 的参数一致)
+    SCAN_CK = CARD_CK.slice(0);
     var timer = setTimeout(function () {
       timedOut = true;
       $("loading").classList.add("hidden");
@@ -202,7 +232,7 @@
       showError("扫描时间较长(超过 20 秒)。文档对象可能较多，后台仍在继续，完成后会自动显示结果。");
     }, 20000);
 
-    execJsx("runPreflight();", function (data, raw) {
+    execJsx("runPreflight(" + ckArgs() + ");", function (data, raw) {
       // v8.1: 不再因超时丢弃迟到的结果 —— 照常渲染,并补一条"耗时较长"提示
       scanBusy = false;   // v8.6: 必须先解锁再分支 —— 下面有提前 return,漏了就锁死面板
       clearTimeout(timer);
@@ -260,7 +290,55 @@
         ? '<span class="fbuild">符号 ' + d.symbols.count + " 个" +
           (d.symbols.scanned ? "(已扫描内部内容)" : "(内部不可访问)") + "</span>" : "");
 
+    // v8.7.1: 诊断行(页脚灰字)—— 耗时分解 + 本轮卡片 + 各类对象访问数/实扫数。
+    //   「实扫:油墨路径 0」即证明卡⑥真的没进检查分支(不只是界面置灰);
+    //   分段耗时用来定位瓶颈到底在哪(准备/遍历/隐藏文字补扫/缺字查表)。
+    if (d.diag) {
+      var dm = d.diag.ms || {}, dv = d.diag.vis || {}, dt = d.diag.ticks || {};
+      var ckNames = ["①", "②", "③", "④", "⑤", "⑥"];
+      // 注意: render 内的 scanCk 在本块之后才赋值(var 提升,此处仍 undefined),
+      //       必须就地取快照 —— 曾因直接用 scanCk 报 "Cannot read property '0' of undefined"
+      var dck = SCAN_CK || CARD_CK;
+      var ckOn = "", nOn = 0;
+      for (var dj = 0; dj < 6; dj++) if (dck[dj]) { ckOn += ckNames[dj]; nOn++; }
+      foot.innerHTML +=
+        '<span class="fbuild">耗时 ' + (dm.total || 0) + 'ms（准备 ' + (dm.pre || 0) +
+        ' / 遍历 ' + (dm.walk || 0) + ' / 隐藏文字 ' + (dm.ht || 0) +
+        ' / 缺字 ' + (dm.miss || 0) + '）· 本轮卡片 ' + (nOn ? ckOn : "全关") + '</span>' +
+        '<span class="fbuild">访问:路径 ' + (dv.path || 0) + ' · 文本 ' + (dv.text || 0) +
+        ' · 组 ' + (dv.group || 0) +
+        ' · 图 ' + ((dv.raster || 0) + (dv.placed || 0)) +
+        ((dv.hid || 0) ? ' · 隐藏跳过 ' + dv.hid : '') +
+        ' ｜ 实扫:油墨路径 ' + ((dt.path || 0) + (dt.compound || 0)) +
+        ' · 文本 ' + (dt.text || 0) +
+        ' · 分辨率图 ' + ((dt.raster || 0) + (dt.placed || 0)) + '</span>';
+      // v8.7.2: 第 3 行 —— 遍历耗时分解(出血/油墨)
+      // v8.7.3: 加细分 4 项(类型/隐藏/列表/取对象),其余归"其他";
+      //   用于定位"只勾②仍需 8.6s"里每个对象 ~0.86ms 的构成
+      var dsplit = d.diag.split || {};
+      var dfine = d.diag.fine || {};
+      var dbleed = dsplit.bleed || 0, dink = dsplit.ink || 0;
+      var dtype = dfine.type || 0, dhid = dfine.hid || 0;
+      var dcoll = dfine.coll || 0, didx = dfine.idx || 0;
+      var dother = Math.max(0, (dm.walk || 0) - dbleed - dink - dtype - dhid - dcoll - didx);
+      // v8.7.6: every 路径标注 —— 1=✓生效 / 0=✗回退(集合没这方法) / -1=尝试后异常。
+      //   实验②定论依据: 只有"层✓组✓"才说明 every 真跑上了(此时取对象应≈0)
+      var dev = d.diag.ev;
+      var evSuf = "";
+      if (dev && (dev.l === 0 || dev.l === 1 || dev.l === -1)) {
+        var evM = function (v) { return v === 1 ? "✓" : (v === 0 ? "✗" : "异常"); };
+        evSuf = " · every 层" + evM(dev.l) + " 组" + evM(dev.g);
+      }
+      foot.innerHTML +=
+        '<span class="fbuild">分解:出血 ' + dbleed + ' · 油墨 ' + dink +
+        ' · 类型 ' + dtype + ' · 隐藏 ' + dhid + ' · 列表 ' + dcoll +
+        ' · 取对象 ' + didx + ' · 其他 ' + dother + ' ms' +
+        ' · 剪枝组 ' + (dsplit.pruned || 0) + evSuf + '</span>';
+    }
+
     var html = "";
+    // v8.7: 本轮扫描使用的开关快照 —— 关掉的卡用占位卡顶替(数据可能为空/未扫)
+    var scanCk = SCAN_CK || CARD_CK;
 
     // ===== 1. 画板 · 出血 · 色彩(v4.0: 色彩模式并入,原第2项移除) =====
     var cmOk = d.colorMode === "CMYK";
@@ -313,9 +391,9 @@
     // v5.0: 出血不足时右上角追加"出血不足"徽标(黄底),与色彩徽标并列
     var bleedChip = (bleedLevel === "warn" && badAbs.length > 0)
       ? chip("warn", "出血不足") : "";
-    html += card("画板 · 出血 · 色彩", c1Level, cmOk ? "CMYK" : "RGB",
+    html += scanCk[0] ? card("画板 · 出血 · 色彩", c1Level, cmOk ? "CMYK" : "RGB",
       '<table class="kv">' + abRows + "</table>" + bleedHtml + cmHtml,
-      cmOk ? "ok" : "bad", bleedChip);
+      cmOk ? "ok" : "bad", bleedChip) : offCard("画板 · 出血 · 色彩");
 
     // ===== 2. 隐藏对象 =====
     var hd = d.hidden || { layerCount: 0, itemCount: 0, layerNames: [], truncated: false };
@@ -338,7 +416,8 @@
       if (hd.truncated) hdHtml += '<div class="dim">(仅扫描前 3000 个)</div>';
     }
     // v5.20: 有隐藏内容时徽标转红(左边条维持黄色,仅徽标级别改 bad)
-    html += card("隐藏对象", hdLevel, hdTotal > 0 ? hdTotal + " 个" : "无", hdHtml, hdTotal > 0 ? "bad" : "ok");
+    html += scanCk[1] ? card("隐藏对象", hdLevel, hdTotal > 0 ? hdTotal + " 个" : "无", hdHtml, hdTotal > 0 ? "bad" : "ok")
+      : offCard("隐藏对象");
 
     // ===== 3. 字体转曲 =====
     // v5.14: 转曲状态与缺失字体是两个独立状态,徽标并列显示(修 bug: 原三目
@@ -432,7 +511,8 @@
         '<button class="btn-action" id="btnOutline">一键转曲</button>' +
         '</div>';
     }
-    html += card("字体转曲", fLevel, fChip, fHtml, fChipLevel, missChip + tinyChip);
+    html += scanCk[2] ? card("字体转曲", fLevel, fChip, fHtml, fChipLevel, missChip + tinyChip)
+      : offCard("字体转曲");
 
     // ===== 4. 图片嵌入 =====
     // v5.15: 缺失链接——源文件不存在的链接图计数、清单标红、徽标转"缺失 N 张"
@@ -461,7 +541,8 @@
     if (d.images.linkedCount > 0) {
       iHtml += '<div class="action-row"><button class="btn-action" id="btnEmbed">一键嵌入</button></div>';
     }
-    html += card("图片嵌入", iLevel, missN > 0 ? ("缺失 " + missN + " 张") : (d.images.linkedCount > 0 ? "有链接图" : "全部嵌入"), iHtml);
+    html += scanCk[3] ? card("图片嵌入", iLevel, missN > 0 ? ("缺失 " + missN + " 张") : (d.images.linkedCount > 0 ? "有链接图" : "全部嵌入"), iHtml)
+      : offCard("图片嵌入");
 
     // ===== 5. 图片分辨率 =====
     var rs = d.resolution || { total: 0, lowCount: 0, okCount: 0, samples: [], truncated: false };
@@ -490,7 +571,8 @@
       if (rs.truncated) rsHtml += '<div class="dim">(仅扫描前 3000 张)</div>';
       // v5.18: "低于 300ppi…建议更换高清图源"提示灰字按用户要求移除
     }
-    html += card("图片分辨率", rsLevel, rs.lowCount > 0 ? "有 " + rs.lowCount + " 张偏低" : "全部达标", rsHtml);
+    html += scanCk[4] ? card("图片分辨率", rsLevel, rs.lowCount > 0 ? "有 " + rs.lowCount + " 张偏低" : "全部达标", rsHtml)
+      : offCard("图片分辨率");
 
     // ===== 6. 油墨 · 描边粗细 (v6.2: 方案 B —— 按"问题类型"分块,标题统一) =====
     var bt = d.black.text, bp = d.black.path;
@@ -677,7 +759,8 @@
     // v8.3: 叠印另走 extraChip(第 6 参),**不并入上面计数** —— 主徽标仍只管油墨/描边。
     //   第 5 参传 null ⇒ chipLevel||level,主徽标配色与旧版完全一致。
     var ovpChip = ovpN > 0 ? chip("bad", "有叠印") : "";
-    html += card("油墨 · 叠印 · 描边粗细", bLevel, bChip, bHtml, null, ovpChip);
+    html += scanCk[5] ? card("油墨 · 叠印 · 描边粗细", bLevel, bChip, bHtml, null, ovpChip)
+      : offCard("油墨 · 叠印 · 描边粗细");
 
     $("results").innerHTML = html;
 
@@ -815,6 +898,22 @@
 
   // ---------- 启动 ----------
   document.addEventListener("DOMContentLoaded", function () {
+    // v8.7: 六卡开关回填 + 变更保存(localStorage;下次点「开始检查」生效)
+    for (var ci = 0; ci < 6; ci++) {
+      (function (idx) {
+        var box = $("ck" + (idx + 1));
+        if (!box) return;
+        box.checked = CARD_CK[idx];
+        box.onchange = function () {
+          CARD_CK[idx] = box.checked;
+          try {
+            var s = "", i;
+            for (i = 0; i < 6; i++) s += CARD_CK[i] ? "1" : "0";
+            localStorage.setItem("pf_cards", s);
+          } catch (eP) {}
+        };
+      })(ci);
+    }
     // v8.0: 必须包一层 —— 若直接把 run 当监听器,浏览器会把 click 事件对象传进第 1 参(keepNotice),
     //       事件对象恒为真 ⇒ 手动点"开始检查"也会保留旧提示(不再是"清残留"语义)
     $("btnRun").addEventListener("click", function () { run(); });
